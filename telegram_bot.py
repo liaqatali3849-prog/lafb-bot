@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 # v2
 """LAFB_Bot - Simple Telegram Assistant (Cloud)"""
 
 import os
