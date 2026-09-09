@@ -1,3 +1,0 @@
-python-telegram-bot==22.8
-google-genai
-requests
