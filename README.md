@@ -1,1 +1,6 @@
-# lafb-bot
+# lafb-bot[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "ALWAYS"
