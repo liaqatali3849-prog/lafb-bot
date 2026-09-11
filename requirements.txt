@@ -1,4 +1,4 @@
 python-telegram-bot==22.8
-google-genai
+google-genai==1.47.0
 requests
 python-pptx

@@ -19,7 +19,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL = "gemini-3.5-flash-lite"
 
-# How many past messages to remember per user (keeps costs tiny)
+# How many past messages (user+bot) to remember per chat
 MEMORY_LIMIT = 10
 
 # Honest system prompt: the bot must never fake being a doer
@@ -28,15 +28,14 @@ SYSTEM_PROMPT = (
     "STRICT RULES you must always follow: "
     "1) NEVER claim you did a real-world task (emails, files, accounts, "
     "Gmail cleanup, etc.) unless a tool result in this conversation proves it. "
-    "You have no tools. If Liaqat asks you to DO something outside this chat "
-    "(organize Gmail, delete files, log in somewhere), clearly say: 'I can "
-    "guide you step by step, but I cannot do it myself.' Then give the steps. "
-    "2) NEVER invent facts. If you do not know something, say 'I am not sure'. "
-    "3) You cannot remember past conversations after a restart, but you DO "
-    "remember everything in the current conversation. "
+    "You have no tools. If asked to DO something outside this chat (organize "
+    "Gmail, delete files, log in somewhere), clearly say: 'I can guide you "
+    "step by step, but I cannot do it myself.' Then give the steps. "
+    "2) NEVER invent facts. If you do not know, say 'I am not sure'. "
+    "3) You remember the current conversation, not past sessions. "
     "4) Be concise, warm and helpful. "
-    "5) For research questions, answer from your knowledge and say when "
-    "information may be outdated."
+    "5) For news/research questions, answer from knowledge and note when "
+    "information may be outdated. You have no live internet."
 )
 
 gemini_client = None
@@ -50,35 +49,54 @@ if GEMINI_KEY:
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------- memory ---
+# ------------------------------------------------------------- memory ---
 
-# Memory store: chat_id -> list of {"role": "user"|"model", "text": str}
+# chat_id -> list of {"role": "user"|"model", "text": str}
 MEMORY_STORE = {}
+
 
 def context_history(key: str):
     return MEMORY_STORE.setdefault(key, [])
 
+
 def set_context_history(key: str, history):
     MEMORY_STORE[key] = history
 
-def build_contents(chat_id: int, user_text: str):
-    """Build the full conversation (memory + new message) for Gemini."""
-    history = context_history(f"chat_{chat_id}")
-    contents = []
-    for msg in history:
-        if msg["role"] == "user":
-            contents.append({"role": "user", "parts": [msg["text"]]})
-        else:
-            contents.append({"role": "model", "parts": [msg["text"]]})
-    contents.append({"role": "user", "parts": [user_text]})
-    return contents
 
-# ------------------------------------------------------------- PPT maker ---
+def build_prompt(chat_id: int, user_text: str) -> str:
+    """Flatten conversation memory + new message into ONE prompt string.
+    (Works on every google-genai SDK version, unlike multi-turn lists.)"""
+    history = context_history(f"chat_{chat_id}")
+    lines = []
+    for msg in history:
+        who = "User" if msg["role"] == "user" else "You"
+        lines.append(f"{who}: {msg['text']}")
+    if lines:
+        return (
+            "Conversation so far (most recent last):\n"
+            + "\n".join(lines)
+            + "\n\nUser's new message: "
+            + user_text
+        )
+    return user_text
+
+
+def save_exchange(chat_id: int, user_text: str, bot_text: str):
+    key = f"chat_{chat_id}"
+    history = context_history(key)
+    history.append({"role": "user", "text": user_text})
+    history.append({"role": "model", "text": bot_text})
+    if len(history) > MEMORY_LIMIT:
+        del history[:-MEMORY_LIMIT]
+    set_context_history(key, history)
+
+
+# ---------------------------------------------------------- PPT maker ---
 
 def make_pptx(topic: str, outline_text: str) -> bytes:
     """Build a simple .pptx from a topic + outline text. Returns file bytes."""
     from pptx import Presentation
-    from pptx.util import Inches, Pt
+    from pptx.util import Pt
 
     prs = Presentation()
 
@@ -87,10 +105,10 @@ def make_pptx(topic: str, outline_text: str) -> bytes:
     slide.shapes.title.text = topic.title()
     slide.placeholders[1].text = "Made by LAFB_Bot"
 
-    # Content slides: split outline into blocks by blank lines
+    # Content slides: outline sections separated by blank lines
     blocks = [b.strip() for b in outline_text.split("\n\n") if b.strip()]
-    for block in blocks[:8]:  # max 8 slides
-        lines = [l.strip("- *• ") for l in block.split("\n") if l.strip()]
+    for block in blocks[:8]:  # max 8 content slides
+        lines = [l.strip("- *•") for l in block.split("\n") if l.strip()]
         if not lines:
             continue
         title = lines[0][:80]
@@ -109,6 +127,7 @@ def make_pptx(topic: str, outline_text: str) -> bytes:
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
+
 
 async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage: /ppt topic here"""
@@ -143,7 +162,8 @@ async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"PPT error: {e}")
         await status.edit_text("Sorry, something went wrong making the PPT.")
 
-# ------------------------------------------------------------- handlers ---
+
+# ------------------------------------------------------------ handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -156,12 +176,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "What I CANNOT do (I will never pretend I can):\n"
         "- Access your Gmail, files, passwords or accounts\n"
         "- Do tasks outside this chat on your computer\n\n"
+        "Commands: /start /clear /ppt\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
+
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     MEMORY_STORE.pop(f"chat_{update.effective_chat.id}", None)
-    await update.message.reply_text("Memory cleared. Fresh start! \U0001F9F9")
+    await update.message.reply_text("Memory cleared. Fresh start! 🧹")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -176,28 +199,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         response = gemini_client.models.generate_content(
             model=MODEL,
-            contents=build_contents(chat_id, text),
+            contents=build_prompt(chat_id, text),
             config={"system_instruction": SYSTEM_PROMPT},
         )
         reply = response.text.strip()
-        # save the exchange into this chat's memory
-        key = f"chat_{chat_id}"
-        history = context_history(key)
-        history.append({"role": "user", "text": text})
-        history.append({"role": "model", "text": reply})
-        if len(history) > MEMORY_LIMIT:
-            del history[:-MEMORY_LIMIT]
-        set_context_history(key, history)
+        save_exchange(chat_id, text, reply)
         await status_msg.edit_text(reply)
     except Exception as e:
         logger.error(f"AI error: {e}")
         await status_msg.edit_text("Sorry, something went wrong. Please try again.")
 
-# --------------------------------------------------------------- main ---
+
+# ---------------------------------------------------------------- main ---
 
 def main():
     print("=" * 40)
-    print("  LAFB_Bot - Cloud Version v2 (honest + memory + PPT)")
+    print("  LAFB_Bot - Cloud v2 (honest + memory + PPT)")
     print("=" * 40)
     print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
     print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
@@ -216,48 +233,6 @@ def main():
     print("\nBot running! Message @LAFB_Bot\n")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
-    main()
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    
-    if not gemini_client:
-        await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
-        return
-    
-    status_msg = await update.message.reply_text("Thinking...")
-    
-    try:
-        prompt = f"You are a helpful assistant. Answer concisely.\n\nUser: {text}"
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash-lite", 
-            contents=prompt
-        )
-        await status_msg.edit_text(response.text.strip())
-    except Exception as e:
-        logger.error(f"AI error: {e}")
-        await status_msg.edit_text("Sorry, something went wrong. Please try again.")
-
-def main():
-    print("=" * 40)
-    print("  LAFB_Bot - Cloud Version")
-    print("=" * 40)
-    print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
-    print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
-    print("=" * 40)
-
-    if not BOT_TOKEN:
-        print("ERROR: No bot token!")
-        sys.exit(1)
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("\nBot running! Message @LAFB_Bot\n")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
