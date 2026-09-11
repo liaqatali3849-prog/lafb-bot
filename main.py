@@ -34,7 +34,10 @@ SYSTEM_PROMPT = (
     "2) NEVER invent facts. If you do not know, say 'I am not sure'. "
     "3) You remember the current conversation, not past sessions. "
     "4) Be concise, warm and helpful. "
-    "5) For news/research questions, answer from knowledge and note when "
+    "5) EXCEPTION - your ONE real power: you CAN create PowerPoint files. "
+    "If asked for a presentation/PPT/slides, never say you cannot - tell "
+    "the user to send /ppt <topic> (it may arrive as its own message). "
+    "6) For news/research questions, answer from knowledge and note when "
     "information may be outdated. You have no live internet."
 )
 
@@ -108,7 +111,7 @@ def make_pptx(topic: str, outline_text: str) -> bytes:
     # Content slides: outline sections separated by blank lines
     blocks = [b.strip() for b in outline_text.split("\n\n") if b.strip()]
     for block in blocks[:8]:  # max 8 content slides
-        lines = [l.strip("- *•") for l in block.split("\n") if l.strip()]
+        lines = [l.strip("- *•#") for l in block.split("\n") if l.strip()]
         if not lines:
             continue
         title = lines[0][:80]
@@ -129,9 +132,26 @@ def make_pptx(topic: str, outline_text: str) -> bytes:
     return buf.getvalue()
 
 
-async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /ppt topic here"""
-    topic = " ".join(context.args).strip()
+# ------------------------------------------- natural-language PPT detect ---
+
+PPT_KEYWORDS = ("ppt", "pptx", "powerpoint", "slide", "presentation")
+REQUEST_WORDS = (
+    "make", "create", "generate", "build", "prepare", "give", "send",
+    "need", "want", "please", "can you", "do", "draft",
+)
+
+
+def wants_ppt(text: str) -> bool:
+    """True if the user is asking for a presentation in natural words."""
+    t = text.lower()
+    if not any(k in t for k in PPT_KEYWORDS):
+        return False
+    return any(w in t for w in REQUEST_WORDS)
+
+
+async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE, topic_override: str = ""):
+    """Usage: /ppt topic here  (or natural language, auto-detected)"""
+    topic = topic_override.strip() or " ".join(context.args).strip()
     if not topic:
         await update.message.reply_text(
             "Usage: /ppt <topic>\nExample: /ppt Benefits of solar energy"
@@ -143,6 +163,21 @@ async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text(f"Creating presentation: {topic} ...")
     try:
+        # If the topic came from a full natural sentence, extract a clean topic
+        if len(topic.split()) > 6:
+            try:
+                t = gemini_client.models.generate_content(
+                    model=MODEL,
+                    contents=(
+                        "Extract the presentation topic from this request. "
+                        "Reply with ONLY the topic in 2-8 words, nothing else: "
+                        + topic
+                    ),
+                ).text.strip().strip('"')
+                if t:
+                    topic = t[:80]
+            except Exception:
+                pass  # keep original topic if extraction fails
         outline_prompt = (
             f"Create a presentation outline for: {topic}\n"
             "Return 5-8 sections. Each section: a title line, then 3-5 short "
@@ -191,6 +226,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not gemini_client:
         await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
+        return
+
+    # Natural-language PPT request? Route to the REAL PowerPoint generator
+    if wants_ppt(text):
+        await ppt_command(update, context, topic_override=text)
         return
 
     status_msg = await update.message.reply_text("Thinking...")
