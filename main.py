@@ -34,9 +34,11 @@ SYSTEM_PROMPT = (
     "2) NEVER invent facts. If you do not know, say 'I am not sure'. "
     "3) You remember the current conversation, not past sessions. "
     "4) Be concise, warm and helpful. "
-    "5) EXCEPTION - your ONE real power: you CAN create PowerPoint files. "
-    "If asked for a presentation/PPT/slides, never say you cannot - tell "
-    "the user to send /ppt <topic> (it may arrive as its own message). "
+    "5) EXCEPTION - your REAL powers: you CAN create PowerPoint files "
+    "(/ppt), summarize meeting notes (/notes) and plan projects (/project). "
+    "If asked for a presentation, never say you cannot - use /ppt. If the "
+    "user pastes long messy meeting text, offer /notes. If they describe a "
+    "project idea, offer /project. "
     "6) For news/research questions, answer from knowledge and note when "
     "information may be outdated. You have no live internet."
 )
@@ -198,6 +200,72 @@ async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE, topic_
         await status.edit_text("Sorry, something went wrong making the PPT.")
 
 
+# ----------------------------------------------------- meeting notes ---
+
+async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /notes <paste your raw meeting text>"""
+    raw = " ".join(context.args).strip()
+    if len(raw) < 40:
+        await update.message.reply_text(
+            "Usage: /notes <paste your raw meeting notes>\n\n"
+            "Example:\n/notes met with sarim re launch - budget not approved, "
+            "need deck by friday, ali to review pricing, next call monday 10am"
+        )
+        return
+    if not gemini_client:
+        await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
+        return
+
+    status = await update.message.reply_text("Summarizing your notes...")
+    try:
+        prompt = (
+            "Summarize these raw meeting notes. Return EXACTLY these sections:\n"
+            "\U0001F4CB Summary: 2-3 sentences\n"
+            "\u2705 Decisions: bullet list (or 'None mentioned')\n"
+            "\U0001F4C5 Action items: who does what, with deadlines if present\n"
+            "\U0001F4A1 Ideas/thoughts: interesting ideas mentioned (or 'None')\n"
+            "Keep it short and clear.\n\nRaw notes:\n" + raw[:8000]
+        )
+        r = gemini_client.models.generate_content(model=MODEL, contents=prompt)
+        await status.edit_text(r.text.strip()[:4000])
+    except Exception as e:
+        logger.error(f"Notes error: {e}")
+        await status.edit_text("Sorry, something went wrong summarizing.")
+
+
+# ------------------------------------------------------ project planner ---
+
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /project <describe the project>"""
+    desc = " ".join(context.args).strip()
+    if len(desc) < 10:
+        await update.message.reply_text(
+            "Usage: /project <describe your project>\n\n"
+            "Example:\n/project open a small online clothing shop in Dubai"
+        )
+        return
+    if not gemini_client:
+        await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
+        return
+
+    status = await update.message.reply_text("Planning your project...")
+    try:
+        prompt = (
+            "Create a practical project plan for: " + desc[:4000] + "\n"
+            "Return EXACTLY these sections, short and practical:\n"
+            "\U0001F3AF Goal: one sentence\n"
+            "\U0001F9E9 Phases: 3-5 phases, each with 1-line description\n"
+            "\U0001F4C5 Timeline: rough estimate per phase\n"
+            "\u26A0\uFE0F Risks: top 2-3 risks\n"
+            "\U0001F9E0 My suggestion: one clever tip most people miss\n"
+        )
+        r = gemini_client.models.generate_content(model=MODEL, contents=prompt)
+        await status.edit_text(r.text.strip()[:4000])
+    except Exception as e:
+        logger.error(f"Project error: {e}")
+        await status.edit_text("Sorry, something went wrong planning.")
+
+
 # ------------------------------------------------------------ handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,12 +274,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I am your AI assistant. I remember our conversation while we talk.\n\n"
         "What I CAN do:\n"
         "- Answer questions & chat (with memory)\n"
-        "- /ppt <topic> - make a PowerPoint and send it here\n"
+        "- /ppt <topic> - PowerPoint sent right here (also works in plain words!)\n"
+        "- /notes <raw meeting text> - summary, decisions, action items, ideas\n"
+        "- /project <description> - goal, phases, timeline, risks\n"
         "- Explain any topic\n\n"
         "What I CANNOT do (I will never pretend I can):\n"
         "- Access your Gmail, files, passwords or accounts\n"
         "- Do tasks outside this chat on your computer\n\n"
-        "Commands: /start /clear /ppt\n\n"
+        "Commands: /start /clear /ppt /notes /project\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
@@ -254,7 +324,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("=" * 40)
-    print("  LAFB_Bot - Cloud v2 (honest + memory + PPT)")
+    print("  LAFB_Bot - Cloud v3 (honest + memory + PPT + notes + project)")
     print("=" * 40)
     print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
     print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
@@ -268,6 +338,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ppt", ppt_command))
+    app.add_handler(CommandHandler("notes", notes_command))
+    app.add_handler(CommandHandler("project", project_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("\nBot running! Message @LAFB_Bot\n")
