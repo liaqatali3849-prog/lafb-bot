@@ -36,11 +36,16 @@ SYSTEM_PROMPT = (
     "2) NEVER invent facts. If you do not know, say 'I am not sure'. "
     "3) You remember the current conversation, not past sessions. "
     "4) Be concise, warm and helpful. "
-    "5) EXCEPTION - your REAL powers: you CAN create PowerPoint files "
-    "(/ppt), summarize meeting notes (/notes) and plan projects (/project). "
-    "If asked for a presentation, never say you cannot - use /ppt. If the "
-    "user pastes long messy meeting text, offer /notes. If they describe a "
-    "project idea, offer /project. "
+    "5) EXCEPTION - your REAL powers: PowerPoint files (/ppt), meeting "
+    "notes summary (/notes), project plans (/project), and REAL Gmail "
+    "access (/gmail: scan the mailbox, list cleanup candidates, move "
+    "chosen emails to Trash - recoverable 30 days), and read mail + draft "
+    "replies (/reply - drafts go to Gmail Drafts, NEVER auto-sent). If "
+    "Liaqat asks to read mails, find an email, or draft a reply, NEVER say "
+    "you cannot - use /reply. If Liaqat asks to "
+    "clean/organize/check Gmail or free storage, NEVER say you cannot - "
+    "run /gmail. For anything else outside this chat (computer files, "
+    "logins, other accounts) say you cannot and guide instead. "
     "6) For news/research questions, answer from knowledge and note when "
     "information may be outdated. You have no live internet."
 )
@@ -151,6 +156,21 @@ def wants_ppt(text: str) -> bool:
     if not any(k in t for k in PPT_KEYWORDS):
         return False
     return any(w in t for w in REQUEST_WORDS)
+
+
+GMAIL_KEYWORDS = ("gmail", "inbox", "mailbox", "email", "e-mail", "mail", "storage")
+GMAIL_ACTIONS = (
+    "clean", "clear", "delete", "remove", "trash", "free", "full",
+    "organize", "organise", "tidy", "scan", "check", "eating", "manage",
+)
+
+
+def wants_gmail_cleanup(text: str) -> bool:
+    """True if the user is asking about Gmail cleanup/management in plain words."""
+    t = text.lower()
+    if not any(k in t for k in GMAIL_KEYWORDS):
+        return False
+    return any(w in t for w in GMAIL_ACTIONS)
 
 
 async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE, topic_override: str = ""):
@@ -328,6 +348,73 @@ async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text("Sorry, Gmail check failed. Please try again later.")
 
 
+# ------------------------------------------------- read mail & draft ---
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /reply           - read latest 5 mails, numbered
+           /reply 3           - bot drafts a reply to mail #3 (goes to Drafts)
+           /reply search xyz  - search mails by text"""
+    if not gmail_power.gmail_available():
+        await update.message.reply_text("Gmail power is not configured (missing COMPOSIO_API_KEY).")
+        return
+
+    args = " ".join(context.args).strip()
+    mails = context.chat_data.get("reply_mails")
+
+    # --- draft a reply to a numbered mail
+    if args.isdigit():
+        n = int(args)
+        if not mails or n < 1 or n > len(mails):
+            await update.message.reply_text(f"I don't have mail #{n} listed. Run /reply first.")
+            return
+        mail = mails[n - 1]
+        status = await update.message.reply_text(f"Reading mail #{n} and drafting a reply...")
+        try:
+            prompt = (
+                f"Write a polite, concise professional email reply.\n"
+                f"From: {mail['from']}\nSubject: {mail['subject']}\n"
+                f"Their message:\n{mail['body'][:1500]}\n\n"
+                "Write ONLY the reply body text (no subject line, no greetings "
+                "to me). Sign it simply as 'Best regards'."
+            )
+            r = gemini_client.models.generate_content(model=MODEL, contents=prompt)
+            body = r.text.strip()
+            gmail_power.create_draft(
+                to=mail["from"], subject="Re: " + mail["subject"], body=body,
+                thread_id=mail["thread"],
+            )
+            await status.edit_text(
+                f"✍️ Reply drafted to: {mail['from']}\n\n"
+                f"Subject: Re: {mail['subject']}\n\n"
+                f"{body[:1500]}\n\n"
+                "📬 It's waiting in your Gmail **Drafts** — check and press Send!"
+            )
+        except Exception as e:
+            logger.error(f"Reply draft error: {e}")
+            await status.edit_text("Sorry, drafting failed. Please try again.")
+        return
+
+    # --- list/search flow
+    query = args[7:].strip() if args.lower().startswith("search ") else ""
+    status = await update.message.reply_text(
+        f"Searching mail for '{query}'..." if query else "Reading your latest mails..."
+    )
+    try:
+        found = gmail_power.read_messages(5, query=query)
+        context.chat_data["reply_mails"] = found
+        if not found:
+            await status.edit_text("No matching mails found.")
+            return
+        lines = ["📬 Latest mails:" if not query else f"🔍 Results for '{query}':"]
+        for i, m in enumerate(found, 1):
+            lines.append(f"{i}. {m['subject']} — from {m['from']} ({m['date']})")
+        lines.append("\nTo draft a reply, send: /reply <number>  (e.g. /reply 2)")
+        await status.edit_text("\n".join(lines))
+    except Exception as e:
+        logger.error(f"Read mail error: {e}")
+        await status.edit_text("Sorry, reading mail failed. Please try again.")
+
+
 # ------------------------------------------------------------ handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,11 +427,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /notes <raw meeting text> - summary, decisions, action items, ideas\n"
         "- /project <description> - goal, phases, timeline, risks\n"
         "- /gmail - check mailbox & safely clean old big emails (real Gmail!)\n"
+        "- /reply - read latest mails, then /reply <no> drafts your reply\n"
         "- Explain any topic\n\n"
         "What I CANNOT do (I will never pretend I can):\n"
-        "- Access your Gmail, files, passwords or accounts\n"
-        "- Do tasks outside this chat on your computer\n\n"
-        "Commands: /start /clear /ppt /notes /project /gmail\n\n"
+        "- Touch your computer files, passwords or other accounts\n"
+        "- Permanent-delete anything (trash is always recoverable 30 days)\n\n"
+        "Commands: /start /clear /ppt /notes /project /gmail /reply\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
@@ -364,6 +452,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Natural-language PPT request? Route to the REAL PowerPoint generator
     if wants_ppt(text):
         await ppt_command(update, context, topic_override=text)
+        return
+
+    # Natural-language Gmail cleanup request? Route to the REAL Gmail power
+    if wants_gmail_cleanup(text):
+        await gmail_command(update, context)
         return
 
     status_msg = await update.message.reply_text("Thinking...")
@@ -387,7 +480,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("=" * 40)
-    print("  LAFB_Bot - Cloud v4 (honest + memory + PPT + notes + project + Gmail)")
+    print("  LAFB_Bot - Cloud v5 (honest + memory + PPT + notes + project + Gmail + drafts)")
     print("=" * 40)
     print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
     print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
@@ -404,6 +497,7 @@ def main():
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("gmail", gmail_command))
+    app.add_handler(CommandHandler("reply", reply_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("\nBot running! Message @LAFB_Bot\n")

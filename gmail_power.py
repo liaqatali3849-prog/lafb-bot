@@ -13,10 +13,20 @@ Design rules:
 """
 
 import os
+import re
 import logging
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def extract_email_address(sender: str) -> str:
+    """'Liaqat Ali <rite2olive@gmail.com>' -> 'rite2olive@gmail.com'"""
+    m = re.search(r"<([\w.+-]+@[\w-]+\.[\w.]+)>", sender or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", sender or "")
+    return m.group(0) if m else (sender or "").strip()
 
 COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY", "")
 COMPOSIO_BASE = "https://backend.composio.dev/api/v3"
@@ -103,6 +113,46 @@ def find_big_newsletters(limit: int = 25) -> list:
 
     with_att = [i for i in all_items if i["attachments"] > 0]
     return with_att[:limit] if with_att else all_items[:limit]
+
+
+def read_messages(count: int = 5, query: str = "") -> list:
+    """Read the latest messages (or search results) with text preview."""
+    args = {"max_results": count, "verbose": True, "include_payload": True}
+    if query:
+        args["query"] = query
+    d = _execute_tool("GMAIL_FETCH_EMAILS", args)
+    msgs = d.get("messages", []) if isinstance(d, dict) else []
+    out = []
+    for m in msgs:
+        labels = m.get("labelIds", []) or []
+        if "CHAT" in labels or "TRASH" in labels:
+            continue
+        body = (m.get("preview", {}) or {}).get("body", "") or ""
+        out.append(
+            {
+                "id": m.get("messageId", ""),
+                "thread": m.get("threadId", ""),
+                "from": (m.get("sender") or "?")[:60],
+                "subject": (m.get("subject") or "(no subject)")[:80],
+                "date": (m.get("messageTimestamp") or "")[:16],
+                "body": body[:400],
+            }
+        )
+    return out
+
+
+def create_draft(to: str, subject: str, body: str, thread_id: str = "") -> str:
+    """Create a Gmail draft (NEVER sends). Verified params: recipient_email,
+    subject, body. Returns confirmation string."""
+    args = {
+        "recipient_email": extract_email_address(to),
+        "subject": subject,
+        "body": body,
+    }
+    if thread_id:
+        args["thread_id"] = thread_id
+    d = _execute_tool("GMAIL_CREATE_EMAIL_DRAFT", args)
+    return "Draft created in your Gmail Drafts folder (nothing sent - YOU press send)."
 
 
 def trash_message(message_id: str) -> bool:
