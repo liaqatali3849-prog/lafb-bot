@@ -4,7 +4,12 @@ Gmail powers for LAFB_Bot via Composio v3 REST API.
 Imported by main.py. Uses only verified tools:
 - GMAIL_GET_PROFILE
 - GMAIL_FETCH_EMAILS
+- GMAIL_CREATE_EMAIL_DRAFT (drafts only - never sends)
 - GMAIL_MOVE_TO_TRASH  (safe: recoverable for 30 days)
+
+MULTI-MAILBOX: all functions take account_id (a Composio connected
+account id). If omitted, the first/original mailbox is used. Call
+discover_mailboxes() to list every mailbox Liaqat has connected.
 
 Design rules:
 - Safe by default: nothing is deleted without user seeing it first.
@@ -34,19 +39,63 @@ COMPOSIO_BASE = "https://backend.composio.dev/api/v3"
 # Composio's secure OAuth flow - the password never touches this bot).
 CONNECTED_ACCOUNT_ID = "ca_8fen8njaqNCw"
 COMPOSIO_USER_ID = "liaqat"
+AUTH_CONFIG_ID = "ac_3QpFnKtTqTYk"
 
 
 def gmail_available() -> bool:
-    return bool(COMPOSIO_API_KEY) and bool(CONNECTED_ACCOUNT_ID)
+    return bool(COMPOSIO_API_KEY)
 
 
-def _execute_tool(tool_slug: str, arguments: dict) -> dict:
+def list_connected_accounts() -> list:
+    """IDs of all ACTIVE connected accounts in this Composio workspace."""
+    url = f"{COMPOSIO_BASE}/connected_accounts"
+    r = requests.get(url, headers={"X-API-Key": COMPOSIO_API_KEY}, timeout=30)
+    data = r.json()
+    items = data.get("items", data if isinstance(data, list) else [])
+    return [it.get("id") for it in items if it.get("status") == "ACTIVE" and it.get("id")]
+
+
+_MAILBOX_CACHE: list = []
+
+
+def discover_mailboxes(refresh: bool = False) -> list:
+    """All connected Gmail mailboxes: [{id, email}]. Cached unless refresh."""
+    if _MAILBOX_CACHE and not refresh:
+        return _MAILBOX_CACHE
+    boxes = []
+    for aid in list_connected_accounts():
+        email = aid
+        try:
+            d = _execute_tool("GMAIL_GET_PROFILE", {}, account_id=aid)
+            rd = d.get("response_data", d)
+            email = rd.get("emailAddress", aid)
+        except Exception:
+            pass  # keep raw id if profile fails - mailbox still usable
+        boxes.append({"id": aid, "email": email})
+    _MAILBOX_CACHE[:] = boxes
+    return boxes
+
+
+def create_connection_link() -> str:
+    """Fresh OAuth link to connect ANOTHER Gmail mailbox (10-min expiry)."""
+    url = f"{COMPOSIO_BASE}/connected_accounts/link"
+    r = requests.post(
+        url,
+        json={"auth_config_id": AUTH_CONFIG_ID, "user_id": COMPOSIO_USER_ID},
+        headers={"X-API-Key": COMPOSIO_API_KEY},
+        timeout=30,
+    )
+    d = r.json()
+    return d.get("redirect_url") or d.get("connectionLink") or ""
+
+
+def _execute_tool(tool_slug: str, arguments: dict, account_id: str = "") -> dict:
     """Execute a Composio tool. Returns the tool's data dict. Raises on failure.
     NOTE (verified live): results live under data['messages'] / data directly,
     NOT under data['response_data']."""
     url = f"{COMPOSIO_BASE}/tools/execute/{tool_slug}"
     payload = {
-        "connected_account_id": CONNECTED_ACCOUNT_ID,
+        "connected_account_id": account_id or CONNECTED_ACCOUNT_ID,
         "user_id": COMPOSIO_USER_ID,
         "arguments": arguments,
     }
@@ -63,9 +112,9 @@ def _execute_tool(tool_slug: str, arguments: dict) -> dict:
     return data.get("data", {})
 
 
-def get_profile() -> str:
+def get_profile(account_id: str = "") -> str:
     """One-line mailbox stats: address + counts."""
-    d = _execute_tool("GMAIL_GET_PROFILE", {})
+    d = _execute_tool("GMAIL_GET_PROFILE", {}, account_id=account_id)
     rd = d.get("response_data", d)  # profile uses response_data, fall back to d
     return (
         f"📧 {rd.get('emailAddress', '?')} — "
@@ -74,7 +123,7 @@ def get_profile() -> str:
     )
 
 
-def find_big_newsletters(limit: int = 25) -> list:
+def find_big_newsletters(limit: int = 25, account_id: str = "") -> list:
     """
     Fetch recent messages (verified shape: data.messages) and flag those with
     attachments as cleanup candidates. Returns list of dicts.
@@ -88,7 +137,7 @@ def find_big_newsletters(limit: int = 25) -> list:
         args = {"max_results": 50, "verbose": True, "include_payload": False}
         if page_token:
             args["page_token"] = page_token
-        d = _execute_tool("GMAIL_FETCH_EMAILS", args)
+        d = _execute_tool("GMAIL_FETCH_EMAILS", args, account_id=account_id)
         msgs = d.get("messages", []) if isinstance(d, dict) else []
         for m in msgs:
             mid = m.get("messageId", "")
@@ -115,12 +164,12 @@ def find_big_newsletters(limit: int = 25) -> list:
     return with_att[:limit] if with_att else all_items[:limit]
 
 
-def read_messages(count: int = 5, query: str = "") -> list:
+def read_messages(count: int = 5, query: str = "", account_id: str = "") -> list:
     """Read the latest messages (or search results) with text preview."""
     args = {"max_results": count, "verbose": True, "include_payload": True}
     if query:
         args["query"] = query
-    d = _execute_tool("GMAIL_FETCH_EMAILS", args)
+    d = _execute_tool("GMAIL_FETCH_EMAILS", args, account_id=account_id)
     msgs = d.get("messages", []) if isinstance(d, dict) else []
     out = []
     for m in msgs:
@@ -141,7 +190,7 @@ def read_messages(count: int = 5, query: str = "") -> list:
     return out
 
 
-def create_draft(to: str, subject: str, body: str, thread_id: str = "") -> str:
+def create_draft(to: str, subject: str, body: str, thread_id: str = "", account_id: str = "") -> str:
     """Create a Gmail draft (NEVER sends). Verified params: recipient_email,
     subject, body. Returns confirmation string."""
     args = {
@@ -151,13 +200,13 @@ def create_draft(to: str, subject: str, body: str, thread_id: str = "") -> str:
     }
     if thread_id:
         args["thread_id"] = thread_id
-    d = _execute_tool("GMAIL_CREATE_EMAIL_DRAFT", args)
+    d = _execute_tool("GMAIL_CREATE_EMAIL_DRAFT", args, account_id=account_id)
     return "Draft created in your Gmail Drafts folder (nothing sent - YOU press send)."
 
 
-def trash_message(message_id: str) -> bool:
+def trash_message(message_id: str, account_id: str = "") -> bool:
     """Move ONE message to trash (recoverable 30 days). Returns True on success."""
-    d = _execute_tool("GMAIL_MOVE_TO_TRASH", {"message_id": message_id})
+    d = _execute_tool("GMAIL_MOVE_TO_TRASH", {"message_id": message_id}, account_id=account_id)
     return bool(d)
 
 
@@ -171,6 +220,7 @@ def format_report(profile_line: str, items: list) -> str:
         )
     lines.append(
         "\n♻️ These are TRASH candidates (recoverable for 30 days, never permanent).\n"
-        "Reply with numbers to trash, e.g.: 1 3 5  — or /gmail scan again."
+        "Reply with numbers to trash, e.g.: 1 3 5  — or /gmail scan again.\n"
+        "Multiple mailboxes? /mailboxes lists and switches them."
     )
     return "\n".join(lines[:40])

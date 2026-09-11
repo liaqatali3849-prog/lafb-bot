@@ -12,6 +12,7 @@ import os
 import sys
 import logging
 from google import genai
+from google.genai import types as genai_types
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -23,6 +24,9 @@ MODEL = "gemini-3.5-flash-lite"
 
 # How many past messages (user+bot) to remember per chat
 MEMORY_LIMIT = 10
+
+# Per-chat selected mailbox id ("" = the original/default one)
+DEFAULT_ACCOUNT_ID = "ca_8fen8njaqNCw"
 
 # Honest system prompt: the bot must never fake being a doer
 SYSTEM_PROMPT = (
@@ -37,15 +41,17 @@ SYSTEM_PROMPT = (
     "3) You remember the current conversation, not past sessions. "
     "4) Be concise, warm and helpful. "
     "5) EXCEPTION - your REAL powers: PowerPoint files (/ppt), meeting "
-    "notes summary (/notes), project plans (/project), and REAL Gmail "
-    "access (/gmail: scan the mailbox, list cleanup candidates, move "
-    "chosen emails to Trash - recoverable 30 days), and read mail + draft "
-    "replies (/reply - drafts go to Gmail Drafts, NEVER auto-sent). If "
-    "Liaqat asks to read mails, find an email, or draft a reply, NEVER say "
-    "you cannot - use /reply. If Liaqat asks to "
-    "clean/organize/check Gmail or free storage, NEVER say you cannot - "
-    "run /gmail. For anything else outside this chat (computer files, "
-    "logins, other accounts) say you cannot and guide instead. "
+    "notes summary (/notes), live meeting mode (/meeting start ... "
+    "/meeting done - captures notes and voice messages during the meeting), "
+    "project plans (/project), multiple mailboxes (/mailboxes - list, "
+    "switch, add), and REAL Gmail access (/gmail scan + trash, /reply "
+    "read + draft replies - drafts NEVER auto-sent). If Liaqat asks to "
+    "read mails, find an email, or draft a reply, NEVER say you cannot - "
+    "use /reply. If Liaqat asks to clean/organize/check Gmail or use his "
+    "other mailbox, NEVER say you cannot - run /gmail or /mailboxes. "
+    "You also understand VOICE messages (they arrive as transcribed text). "
+    "For anything else outside this chat (computer files, logins, other "
+    "accounts) say you cannot and guide instead. "
     "6) For news/research questions, answer from knowledge and note when "
     "information may be outdated. You have no live internet."
 )
@@ -101,6 +107,22 @@ def save_exchange(chat_id: int, user_text: str, bot_text: str):
     if len(history) > MEMORY_LIMIT:
         del history[:-MEMORY_LIMIT]
     set_context_history(key, history)
+
+
+def current_account_id(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """The mailbox this chat is currently talking to."""
+    return context.chat_data.get("account_id") or DEFAULT_ACCOUNT_ID
+
+
+def current_account_email(account_id: str) -> str:
+    """Pretty email for a mailbox id (falls back to the raw id)."""
+    try:
+        for b in gmail_power.discover_mailboxes():
+            if b["id"] == account_id:
+                return b["email"]
+    except Exception:
+        pass
+    return account_id
 
 
 # ---------------------------------------------------------- PPT maker ---
@@ -217,9 +239,118 @@ async def ppt_command(update: Update, context: ContextTypes.DEFAULT_TYPE, topic_
             document=io.BytesIO(pptx_bytes),
             filename=f"{topic[:40].replace(' ', '_')}.pptx",
         )
+        # Learning: record what the bot made in conversation memory
+        save_exchange(update.effective_chat.id, f"/ppt {topic}", "(sent a PowerPoint on " + topic + ")")
     except Exception as e:
         logger.error(f"PPT error: {e}")
         await status.edit_text("Sorry, something went wrong making the PPT.")
+
+
+# ------------------------------------------------- mailboxes (multi) ---
+
+async def mailboxes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /mailboxes            - list all connected mailboxes
+           /mailboxes 2           - switch this chat to mailbox #2
+           /mailboxes add         - link to connect a NEW mailbox"""
+    if not gmail_power.gmail_available():
+        await update.message.reply_text("Gmail power is not configured (missing COMPOSIO_API_KEY).")
+        return
+    args = " ".join(context.args).strip().lower()
+
+    if args == "add":
+        await update.message.reply_text(
+            "🔗 Tap this link to connect a NEW mailbox (expires in ~10 min):\n\n"
+            + (gmail_power.create_connection_link() or "Could not create link - tell Buffy in Freebuff.")
+            + "\n\nAfter approving, come back and send /mailboxes again - "
+            "the new mailbox will appear in the list."
+        )
+        return
+
+    if args.isdigit():
+        boxes = gmail_power.discover_mailboxes(refresh=True)
+        n = int(args)
+        if 1 <= n <= len(boxes):
+            context.chat_data["account_id"] = boxes[n - 1]["id"]
+            await update.message.reply_text(
+                f"✅ Switched to: {boxes[n - 1]['email']}\n"
+                "/gmail and /reply now work on THIS mailbox."
+            )
+        else:
+            await update.message.reply_text(f"No mailbox #{n}. Send /mailboxes to see the list.")
+        return
+
+    boxes = gmail_power.discover_mailboxes(refresh=True)
+    current = current_account_id(context)
+    if not boxes:
+        await update.message.reply_text("No mailboxes connected yet. Send /mailboxes add")
+        return
+    lines = ["📬 Your connected mailboxes:"]
+    for i, b in enumerate(boxes, 1):
+        mark = " ← current" if b["id"] == current else ""
+        lines.append(f"{i}. {b['email']}{mark}")
+    lines.append("\nSwitch: /mailboxes <no>   •   Add new: /mailboxes add")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ------------------------------------------------- live meeting mode ---
+
+async def meeting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /meeting start  - begin capturing live notes (voice or text)
+           /meeting done    - summarize everything captured into notes"""
+    args = " ".join(context.args).strip().lower()
+    chat_id = update.effective_chat.id
+
+    if args.startswith("start") or not args:
+        context.chat_data["meeting_buffer"] = []
+        await update.message.reply_text(
+            "🎙️ LIVE MEETING MODE - recording your notes.\n\n"
+            "During the meeting, just send me quick bits - text or VOICE "
+            "messages (hold the mic and talk, I transcribe!):\n"
+            "• 'ali will review pricing by thursday'\n"
+            "• 'budget cut to 60 percent'\n\n"
+            "When the meeting ends, send: /meeting done\n"
+            "I'll organize everything into a clean summary. 📋"
+        )
+        return
+
+    if args.startswith("done"):
+        buf = context.chat_data.get("meeting_buffer")
+        if not buf:
+            await update.message.reply_text(
+                "Nothing captured yet. Start with /meeting start, send some "
+                "notes (or voice messages), then /meeting done."
+            )
+            return
+        raw = " ".join(buf)
+        context.chat_data["meeting_buffer"] = []
+        status = await update.message.reply_text(
+            f"Organizing {len(buf)} captured notes into your meeting summary..."
+        )
+        try:
+            prompt = (
+                "These are quick notes captured DURING a live meeting (they may "
+                "be fragmentary, voice-transcribed, unordered). Organize them "
+                "into clean meeting minutes. Return EXACTLY these sections:\n"
+                "\U0001F4CB Summary: 2-3 sentences\n"
+                "\u2705 Decisions: bullet list (or 'None mentioned')\n"
+                "\U0001F4C5 Action items: who does what, with deadlines\n"
+                "\u2753 Open questions: things raised but unresolved\n"
+                "\U0001F4A1 Ideas/thoughts: interesting ideas (or 'None')\n"
+                "\U0001F4A4 Follow-up meeting: if a next meeting was mentioned, "
+                "state when\n\nCaptured notes:\n" + raw[:8000]
+            )
+            r = gemini_client.models.generate_content(model=MODEL, contents=prompt)
+            summary = r.text.strip()[:4000]
+            await status.edit_text(summary)
+            save_exchange(chat_id, "(live meeting notes)", summary)
+        except Exception as e:
+            logger.error(f"Meeting summary error: {e}")
+            await status.edit_text("Sorry, summarizing failed. Your notes were kept - send /meeting done again.")
+            # restore buffer so nothing is lost
+            context.chat_data["meeting_buffer"] = buf
+        return
+
+    await update.message.reply_text("Usage: /meeting start ... /meeting done")
 
 
 # ----------------------------------------------------- meeting notes ---
@@ -323,7 +454,7 @@ async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for n in nums:
             if 1 <= n <= len(pending):
                 try:
-                    gmail_power.trash_message(pending[n - 1]["id"])
+                    gmail_power.trash_message(pending[n - 1]["id"], account_id=current_account_id(context))
                     done += 1
                 except Exception as e:
                     logger.error(f"Trash error: {e}")
@@ -339,10 +470,13 @@ async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- scan flow: /gmail
     status = await update.message.reply_text("Checking your Gmail...")
     try:
-        profile = gmail_power.get_profile()
-        items = gmail_power.find_big_newsletters()
+        profile = gmail_power.get_profile(account_id=current_account_id(context))
+        items = gmail_power.find_big_newsletters(account_id=current_account_id(context))
         context.chat_data["gmail_candidates"] = items
-        await status.edit_text(gmail_power.format_report(profile, items))
+        await status.edit_text(
+            gmail_power.format_report(profile, items)
+            + f"\n\n📬 Mailbox: {current_account_email(current_account_id(context))}"
+        )
     except Exception as e:
         logger.error(f"Gmail error: {e}")
         await status.edit_text("Sorry, Gmail check failed. Please try again later.")
@@ -381,7 +515,7 @@ async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             body = r.text.strip()
             gmail_power.create_draft(
                 to=mail["from"], subject="Re: " + mail["subject"], body=body,
-                thread_id=mail["thread"],
+                thread_id=mail["thread"], account_id=current_account_id(context),
             )
             await status.edit_text(
                 f"✍️ Reply drafted to: {mail['from']}\n\n"
@@ -400,7 +534,7 @@ async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Searching mail for '{query}'..." if query else "Reading your latest mails..."
     )
     try:
-        found = gmail_power.read_messages(5, query=query)
+        found = gmail_power.read_messages(5, query=query, account_id=current_account_id(context))
         context.chat_data["reply_mails"] = found
         if not found:
             await status.edit_text("No matching mails found.")
@@ -413,6 +547,48 @@ async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Read mail error: {e}")
         await status.edit_text("Sorry, reading mail failed. Please try again.")
+
+
+# ------------------------------------------------- voice messages ---
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Transcribe a voice note; if meeting mode is on, capture it too."""
+    if not gemini_client:
+        await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
+        return
+    status = await update.message.reply_text("🎙️ Listening...")
+    try:
+        vg = await update.message.voice.get_file()
+        voice_bytes = await vg.download_as_bytearray()
+        r = gemini_client.models.generate_content(
+            model=MODEL,
+            contents=[
+                "Transcribe this voice message. Reply with ONLY the spoken "
+                "words, no commentary:",
+                # Verified live: pinned SDK needs Part.from_bytes (inline_data)
+                genai_types.Part.from_bytes(
+                    data=bytes(voice_bytes), mime_type="audio/ogg"
+                ),
+            ],
+        )
+        text = (r.text or "").strip()
+        if not text:
+            await status.edit_text("I couldn't hear anything - try again?")
+            return
+        # Capture into live meeting mode if active
+        if context.chat_data.get("meeting_buffer") is not None:
+            context.chat_data["meeting_buffer"].append(text)
+            await status.edit_text(
+                f"🎙️ Captured: {text[:200]}\n\n(added to meeting notes - "
+                f"{len(context.chat_data['meeting_buffer'])} so far)"
+            )
+            return
+        # Outside meetings: treat as a normal spoken message
+        await status.edit_text(f"🗣️ You said: {text}")
+        await handle_message(update, context, override_text=text)
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await status.edit_text("Sorry, couldn't process the voice note.")
 
 
 # ------------------------------------------------------------ handlers ---
@@ -428,11 +604,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /project <description> - goal, phases, timeline, risks\n"
         "- /gmail - check mailbox & safely clean old big emails (real Gmail!)\n"
         "- /reply - read latest mails, then /reply <no> drafts your reply\n"
+        "- /mailboxes - list & switch between your Gmail accounts\n"
+        "- /meeting start ... /meeting done - live meeting notes (voice works!)\n"
+        "- 🎙️ Voice notes - hold mic & talk, I understand\n"
         "- Explain any topic\n\n"
         "What I CANNOT do (I will never pretend I can):\n"
         "- Touch your computer files, passwords or other accounts\n"
+        "- Join/recording Zoom or Meet calls (send notes/voice instead)\n"
         "- Permanent-delete anything (trash is always recoverable 30 days)\n\n"
-        "Commands: /start /clear /ppt /notes /project /gmail /reply\n\n"
+        "Commands: /start /clear /ppt /notes /project /gmail /reply /mailboxes /meeting\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
@@ -442,8 +622,8 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Memory cleared. Fresh start! 🧹")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text: str = ""):
+    text = (override_text or update.message.text or "").strip()
 
     if not gemini_client:
         await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
@@ -480,7 +660,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("=" * 40)
-    print("  LAFB_Bot - Cloud v5 (honest + memory + PPT + notes + project + Gmail + drafts)")
+    print("  LAFB_Bot - Cloud v6 (multi-mailbox + live meetings + voice)")
     print("=" * 40)
     print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
     print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
@@ -498,7 +678,10 @@ def main():
     app.add_handler(CommandHandler("project", project_command))
     app.add_handler(CommandHandler("gmail", gmail_command))
     app.add_handler(CommandHandler("reply", reply_command))
+    app.add_handler(CommandHandler("mailboxes", mailboxes_command))
+    app.add_handler(CommandHandler("meeting", meeting_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     print("\nBot running! Message @LAFB_Bot\n")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
