@@ -591,6 +591,72 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text("Sorry, couldn't process the voice note.")
 
 
+# ------------------------------------------------- audio files (meetings) ---
+
+MAX_AUDIO_MB = 19  # Telegram bot API refuses downloads above 20 MB
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Meeting RECORDING (audio file): transcribe ALL speakers + write minutes
+    in ONE Gemini call (multimodal - no second call needed)."""
+    if not gemini_client:
+        await update.message.reply_text("AI is not configured. Check GEMINI_API_KEY.")
+        return
+    msg = update.message
+    file_obj = msg.audio or (
+        msg.document
+        if msg.document and (msg.document.mime_type or "").startswith("audio")
+        else None
+    )
+    if file_obj is None:
+        return
+    size_mb = (file_obj.file_size or 0) / 1e6
+    if size_mb > MAX_AUDIO_MB:
+        await msg.reply_text(
+            f"That recording is {size_mb:.0f} MB - I can process up to ~{MAX_AUDIO_MB} MB "
+            "(roughly an hour of compressed voice). Tip: trim it, send it in parts, "
+            "or capture live with /meeting start instead."
+        )
+        return
+    status = await msg.reply_text(
+        "🎧 Got the recording. Listening to ALL speakers and writing minutes... "
+        "this can take a minute."
+    )
+    try:
+        tg_file = await file_obj.get_file()
+        audio_bytes = await tg_file.download_as_bytearray()
+        mime = file_obj.mime_type or "audio/mpeg"
+        r = gemini_client.models.generate_content(
+            model=MODEL,
+            contents=[
+                "This is a recorded meeting, possibly with several speakers. "
+                "Create clean meeting minutes from it. Use real names when people "
+                "are identifiable, otherwise 'Speaker 1', 'Speaker 2'. Return "
+                "EXACTLY these sections:\n"
+                "\U0001F4CB Summary: 2-3 sentences\n"
+                "\u2705 Decisions: bullet list (or 'None mentioned')\n"
+                "\U0001F4C5 Action items: who does what, with deadlines\n"
+                "\u2753 Open questions: raised but unresolved\n"
+                "\U0001F4A1 Ideas/thoughts (or 'None')\n"
+                "\U0001F50A Speakers: one line - how many distinct voices you "
+                "heard (best effort, be honest if unclear)",
+                genai_types.Part.from_bytes(data=bytes(audio_bytes), mime_type=mime),
+            ],
+        )
+        minutes = (r.text or "").strip()
+        if not minutes:
+            await status.edit_text("I couldn't hear anything usable in that file.")
+            return
+        await status.edit_text(minutes[:4000])
+        save_exchange(update.effective_chat.id, "(sent a meeting recording)", minutes)
+    except Exception as e:
+        logger.error(f"Audio error: {e}")
+        await status.edit_text(
+            "Sorry, couldn't process that recording. If it's long, try trimming "
+            "it, or send live notes with /meeting start."
+        )
+
+
 # ------------------------------------------------------------ handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -606,7 +672,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /reply - read latest mails, then /reply <no> drafts your reply\n"
         "- /mailboxes - list & switch between your Gmail accounts\n"
         "- /meeting start ... /meeting done - live meeting notes (voice works!)\n"
-        "- 🎙️ Voice notes - hold mic & talk, I understand\n"
+        "- 🎙️ Voice notes - hold mic & talk, I understand (room/speakerphone = everyone)\n"
+        "- 🎧 Meeting recordings - send the audio file, I write minutes from ALL speakers\n"
         "- Explain any topic\n\n"
         "What I CANNOT do (I will never pretend I can):\n"
         "- Touch your computer files, passwords or other accounts\n"
@@ -660,7 +727,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, ove
 
 def main():
     print("=" * 40)
-    print("  LAFB_Bot - Cloud v6 (multi-mailbox + live meetings + voice)")
+    print("  LAFB_Bot - Cloud v6.1 (multi-mailbox + meetings + voice + recordings)")
     print("=" * 40)
     print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
     print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
@@ -682,6 +749,7 @@ def main():
     app.add_handler(CommandHandler("meeting", meeting_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
 
     print("\nBot running! Message @LAFB_Bot\n")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
