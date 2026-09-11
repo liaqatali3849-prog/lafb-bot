@@ -15,6 +15,8 @@ from google import genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+import gmail_power
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 MODEL = "gemini-3.5-flash-lite"
@@ -266,6 +268,66 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text("Sorry, something went wrong planning.")
 
 
+# --------------------------------------------------------- gmail powers ---
+
+async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /gmail          - mailbox status + cleanup candidates
+           /gmail trash 1 3 5 - move listed candidates to trash (safe)"""
+    if not gmail_power.gmail_available():
+        await update.message.reply_text(
+            "Gmail power is not configured (missing COMPOSIO_API_KEY)."
+        )
+        return
+
+    args = " ".join(context.args).strip()
+
+    # --- trash flow: /gmail trash 1 3 5
+    if args.lower().startswith("trash"):
+        pending = context.chat_data.get("gmail_candidates")
+        if not pending:
+            await update.message.reply_text(
+                "No scan results yet. Run /gmail first to see candidates."
+            )
+            return
+        try:
+            nums = [int(n) for n in args.split()[1:] if n.isdigit()]
+        except ValueError:
+            nums = []
+        if not nums:
+            await update.message.reply_text(
+                "Tell me which numbers to trash, e.g.: /gmail trash 1 3 5"
+            )
+            return
+        status = await update.message.reply_text(f"Moving {len(nums)} email(s) to trash...")
+        done, failed = 0, 0
+        for n in nums:
+            if 1 <= n <= len(pending):
+                try:
+                    gmail_power.trash_message(pending[n - 1]["id"])
+                    done += 1
+                except Exception as e:
+                    logger.error(f"Trash error: {e}")
+                    failed += 1
+        await status.edit_text(
+            f"♻️ Done: {done} moved to trash"
+            + (f", {failed} failed" if failed else "")
+            + "\n(Recoverable from Gmail Trash for 30 days)"
+        )
+        context.chat_data.pop("gmail_candidates", None)
+        return
+
+    # --- scan flow: /gmail
+    status = await update.message.reply_text("Checking your Gmail...")
+    try:
+        profile = gmail_power.get_profile()
+        items = gmail_power.find_big_newsletters()
+        context.chat_data["gmail_candidates"] = items
+        await status.edit_text(gmail_power.format_report(profile, items))
+    except Exception as e:
+        logger.error(f"Gmail error: {e}")
+        await status.edit_text("Sorry, Gmail check failed. Please try again later.")
+
+
 # ------------------------------------------------------------ handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,11 +339,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /ppt <topic> - PowerPoint sent right here (also works in plain words!)\n"
         "- /notes <raw meeting text> - summary, decisions, action items, ideas\n"
         "- /project <description> - goal, phases, timeline, risks\n"
+        "- /gmail - check mailbox & safely clean old big emails (real Gmail!)\n"
         "- Explain any topic\n\n"
         "What I CANNOT do (I will never pretend I can):\n"
         "- Access your Gmail, files, passwords or accounts\n"
         "- Do tasks outside this chat on your computer\n\n"
-        "Commands: /start /clear /ppt /notes /project\n\n"
+        "Commands: /start /clear /ppt /notes /project /gmail\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
@@ -324,7 +387,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("=" * 40)
-    print("  LAFB_Bot - Cloud v3 (honest + memory + PPT + notes + project)")
+    print("  LAFB_Bot - Cloud v4 (honest + memory + PPT + notes + project + Gmail)")
     print("=" * 40)
     print(f"  Token: {'OK' if BOT_TOKEN else 'MISSING!'}")
     print(f"  Gemini: {'OK' if gemini_client else 'MISSING!'}")
@@ -340,6 +403,7 @@ def main():
     app.add_handler(CommandHandler("ppt", ppt_command))
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("project", project_command))
+    app.add_handler(CommandHandler("gmail", gmail_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("\nBot running! Message @LAFB_Bot\n")
