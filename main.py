@@ -1041,7 +1041,13 @@ def main():
         print("ERROR: No bot token!")
         sys.exit(1)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(application):
+        """run_polling calls this INSIDE the live event loop — the only safe
+        place to launch background tasks (calling create_task earlier crashes)."""
+        # plain asyncio task (loop is live here); keep a reference so it's never GC'd
+        application.digest_task = asyncio.create_task(daily_digest_loop(application))
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("ppt", ppt_command))
@@ -1075,8 +1081,6 @@ def main():
             except Exception as e:
                 logger.error(f"digest loop error: {e}")
                 await asyncio.sleep(60)
-
-    app.create_task(daily_digest_loop(app))
 
     print("\nBot running! Message @LAFB_Bot\n")
     print("Daily Amazon digest: 07:30 server time\n")
