@@ -4,12 +4,16 @@
 Rules of this bot:
 1. NEVER claim something is done if it was not actually done.
 2. NEVER invent facts. If unsure, say "I am not sure".
-3. Cannot access the user's Gmail, files, passwords, or accounts.
+3. Real powers only where tools exist: Gmail (read/draft/trash), Amazon
+   email digest (read-only). Never touches passwords or logins.
 """
 
 import io
 import os
+import re
 import sys
+import asyncio
+import datetime
 import logging
 from google import genai
 from google.genai import types as genai_types
@@ -17,6 +21,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 import gmail_power
+import amazon_power
+import web_power
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -49,11 +55,22 @@ SYSTEM_PROMPT = (
     "read mails, find an email, or draft a reply, NEVER say you cannot - "
     "use /reply. If Liaqat asks to clean/organize/check Gmail or use his "
     "other mailbox, NEVER say you cannot - run /gmail or /mailboxes. "
+    "You also have REAL Amazon powers: /amazon shows his Amazon seller "
+    "emails (orders, payments, inventory, FBA, alerts) as a digest, and a "
+    "daily Amazon digest arrives automatically in the morning. If Liaqat "
+    "asks about Amazon activity/orders/sales emails, NEVER say you cannot "
+    "- run /amazon. "
     "You also understand VOICE messages (they arrive as transcribed text). "
     "For anything else outside this chat (computer files, logins, other "
     "accounts) say you cannot and guide instead. "
-    "6) For news/research questions, answer from knowledge and note when "
-    "information may be outdated. You have no live internet."
+    "6) You DO have a live NEWS search power: /search <topic> fetches "
+    "current real headlines (Google News) and you summarize them. If "
+    "Liaqat asks for latest news, updates, what's happening, or market "
+    "info, NEVER say you have no internet - run /search. Honest limit: "
+    "it searches NEWS headlines, not whole web pages - say so if he asks "
+    "for deep research. "
+    "7) For other questions, answer from knowledge and note when "
+    "information may be outdated."
 )
 
 gemini_client = None
@@ -71,6 +88,9 @@ logger = logging.getLogger(__name__)
 
 # chat_id -> list of {"role": "user"|"model", "text": str}
 MEMORY_STORE = {}
+
+# Chats that ever talked to us (for the daily Amazon digest)
+KNOWN_CHATS = set()
 
 
 def context_history(key: str):
@@ -110,8 +130,19 @@ def save_exchange(chat_id: int, user_text: str, bot_text: str):
 
 
 def current_account_id(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """The mailbox this chat is currently talking to."""
-    return context.chat_data.get("account_id") or DEFAULT_ACCOUNT_ID
+    """The mailbox this chat is currently talking to.
+    Self-healing: if the user never picked one, use the FIRST ACTIVE
+    connection (survives mailbox swaps/deletions on Composio)."""
+    chosen = context.chat_data.get("account_id")
+    if chosen:
+        return chosen
+    try:
+        boxes = gmail_power.discover_mailboxes(refresh=True)
+        if boxes:
+            return boxes[0]["id"]
+    except Exception as e:
+        logger.error(f"mailbox discovery failed: {e}")
+    return DEFAULT_ACCOUNT_ID
 
 
 def current_account_email(account_id: str) -> str:
@@ -657,6 +688,263 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ------------------------------------------------------------ amazon ---
+
+def wants_amazon(text: str) -> bool:
+    """Detect natural-language Amazon requests so the bot never refuses
+    a power it actually has (learned from the PPT and Gmail episodes).
+    Guard: if he asks for NEWS, route to live search instead."""
+    if re.search(r"\bnews\b|\bheadlines\b", text, re.IGNORECASE):
+        return False
+    return bool(
+        re.search(
+            r"\bamazon\b.*\b(order|orders|sale|sales|email|emails|mail|update|"
+            r"updates|activity|digest|check|payment|payments|inventory|stock|"
+            r"fba|seller|account)\b|\b(amazon digest|amazon activity)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+async def send_amazon_digest(chat_id: int, context: ContextTypes.DEFAULT_TYPE, days: int = 2):
+    """Build + send the Amazon digest to one chat. Returns summary or None."""
+    account_id = current_account_id(context)
+    try:
+        items = amazon_power.fetch_amazon_emails(days=days, account_id=account_id)
+    except Exception as e:
+        logger.error(f"Amazon fetch error: {e}")
+        await context.bot.send_message(
+            chat_id,
+            "Sorry, I could not read your mailbox for the Amazon check. "
+            "Please try again in a minute.",
+        )
+        return None
+    digest = amazon_power.build_digest(items)
+    await context.bot.send_message(chat_id, digest[:4000])
+    context.chat_data["amazon_items"] = items
+    return digest
+
+
+async def amazon_command(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text: str = ""):
+    """Amazon seller email digest: orders, payments, inventory, FBA, alerts."""
+    # "/amazon read <words>" or voice "amazon read ..." opens a specific email
+    m = re.search(r"read (.+)", override_text or " ".join(context.args or []), re.IGNORECASE)
+    if m:
+        await amazon_read_email(update, context, m.group(1))
+        return
+    if not gmail_power.gmail_available():
+        await update.message.reply_text(
+            "Gmail connection is not configured, so I cannot read Amazon "
+            "emails. Check COMPOSIO_API_KEY on the server."
+        )
+        return
+    args = (context.args or [])
+    days = 2
+    if args and args[0].isdigit():
+        days = min(int(args[0]), 14)
+    status = await update.message.reply_text(
+        f"F6E2️ Checking your Amazon emails (last {days} day(s))..."
+    )
+    try:
+        items = amazon_power.fetch_amazon_emails(
+            days=days, account_id=current_account_id(context)
+        )
+    except Exception as e:
+        logger.error(f"Amazon fetch error: {e}")
+        await status.edit_text(
+            "Sorry, I could not read the mailbox just now. Please try again."
+        )
+        return
+    context.chat_data["amazon_items"] = items
+    digest = amazon_power.build_digest(items)
+    await status.edit_text(digest[:4000])
+
+
+async def amazon_read_email(update: Update, context: ContextTypes.DEFAULT_TYPE, words: str):
+    """User picked a digest line: show that email's body + AI summary."""
+    items = context.chat_data.get("amazon_items") or []
+    if not items:
+        await update.message.reply_text(
+            "Run /amazon first so I know which emails you mean. F642"
+        )
+        return
+    status = await update.message.reply_text("F4D6 Opening the email...")
+    try:
+        item = amazon_power.find_email_by_words(items, words)
+        if item is None:
+            await status.edit_text("I could not match that to an email - try /amazon again.")
+            return
+        body = amazon_power.read_email_body(item, account_id=current_account_id(context))
+        summary = ""
+        if gemini_client and body and not body.startswith("("):
+            try:
+                r = gemini_client.models.generate_content(
+                    model=MODEL,
+                    contents=[
+                        "This is an email about an Amazon seller account. Summarize "
+                        "in 3 short lines: what happened, any action needed + deadline, "
+                        "and any money/stock impact. If it is just marketing, say so.",
+                        body[:3000],
+                    ],
+                )
+                summary = (r.text or "").strip()
+            except Exception as e:
+                logger.error(f"Amazon summary error: {e}")
+        text = (
+            f"F4E7 {item['subject']}\n"
+            f"From: {item['from']}  |  {item['date']}\n\n"
+            + (f"F9E0 {summary}\n\n" if summary else "")
+            + body[:1500]
+        )
+        await status.edit_text(text[:4000])
+    except Exception as e:
+        logger.error(f"Amazon read error: {e}")
+        await status.edit_text("Sorry, reading that email failed. Please try again.")
+
+
+async def daily_amazon_digest(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback: morning Amazon digest to every known chat."""
+    for chat_id in list(KNOWN_CHATS):
+        try:
+            await send_amazon_digest(chat_id, context, days=1)
+        except Exception as e:
+            logger.error(f"Daily digest error for {chat_id}: {e}")
+
+
+# ---------------------------------------------------------- web search ---
+
+def wants_search(text: str) -> bool:
+    """Detect news/search requests so the bot uses its REAL live power
+    instead of refusing (learned from the PPT/Gmail/Amazon episodes)."""
+    return bool(
+        re.search(
+            r"\b(search|google|latest|news|headlines|trending|what'?s "
+            r"happening|market (news|update|updates)|updates? about|"
+            r"updates? on|today'?s)\b|^read\s+\d+$",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _extract_query(text: str) -> str:
+    """Turn 'what's the latest update about AI' into 'AI'."""
+    q = re.sub(
+        r"^(can you |could you |please |hey |hi )*(what'?s|what is|any|check|"
+        r"give me|show me|tell me about|do you have)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(
+        r"\b(the\s+)?(latest|news|headlines|updates?|update|today|current|"
+        r"google|search|about|on|for|please)\b",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = q.strip(" ?.!\t")
+    return q or "world news"
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text: str = ""):
+    """REAL live search: Google News headlines + AI summary. Free, no key."""
+    text = (override_text or " ".join(context.args or [])).strip()
+
+    # 'read 2' follow-up: show one story from the last search
+    m_read = re.match(r"read\s+(\d+)", text, re.IGNORECASE)
+    if m_read:
+        items = context.chat_data.get("search_items") or []
+        n = int(m_read.group(1))
+        if not items or n < 1 or n > len(items):
+            await update.message.reply_text(
+                "Run a search first (e.g. 'search amazon fba news'), "
+                "then pick a number from the list. \U0001F642"
+            )
+            return
+        it = items[n - 1]
+        await update.message.reply_text(
+            f"\U0001F4F0 {it['title']}\n\U0001F4F0 Source: {it['source']}  |  {it['date']}\n\n"
+            f"\U0001F517 {it['link'][:500]}\n\n"
+            "(Tap the link to read the full story - I search headlines, "
+            "not full articles.)"
+        )
+        return
+
+    query = _extract_query(text)
+    status = await update.message.reply_text(
+        f"\U0001F50E Searching live news for \u201C{query}\u201D..."
+    )
+    try:
+        items = web_power.search_news(query)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await status.edit_text("Sorry, the news search failed. Please try again.")
+        return
+    context.chat_data["search_items"] = items
+    listing = web_power.format_results(query, items)
+
+    ai = ""
+    if items and gemini_client:
+        try:
+            headlines = "\n".join(
+                f"- {i['title']} ({i['source']})" for i in items[:6]
+            )
+            r = gemini_client.models.generate_content(
+                model=MODEL,
+                contents=[
+                    f"These are current news headlines about '{query}'. In 4 "
+                    "short bullet points, summarize what is happening and why "
+                    "it might matter. Use ONLY what the headlines say - never "
+                    "invent details:",
+                    headlines,
+                ],
+            )
+            ai = (r.text or "").strip()
+        except Exception as e:
+            logger.error(f"Search summary error: {e}")
+
+    out = listing + (f"\n\n\U0001F9E0 Quick take:\n{ai}" if ai else "")
+    await status.edit_text(out[:4000])
+    save_exchange(update.effective_chat.id, f"search {query}", out[:800])
+
+
+async def daily_market_news(context: ContextTypes.DEFAULT_TYPE):
+    """Morning Amazon-seller market news, pushed automatically."""
+    items = web_power.search_news("Amazon seller FBA news", limit=5)
+    if not items:
+        return
+    ai = ""
+    if gemini_client:
+        try:
+            headlines = "\n".join(f"- {i['title']} ({i['source']})" for i in items[:5])
+            r = gemini_client.models.generate_content(
+                model=MODEL,
+                contents=[
+                    "These are today's Amazon-seller news headlines. Write 2 "
+                    "short lines: the most important thing happening and why a "
+                    "small Amazon seller should care. Only from the headlines:",
+                    headlines,
+                ],
+            )
+            ai = (r.text or "").strip()
+        except Exception as e:
+            logger.error(f"Market news AI error: {e}")
+    lines = ["\U0001F4F0 Good morning! Amazon market news:", ""]
+    for i, it in enumerate(items, 1):
+        src = f" \u2014 {it['source']}" if it["source"] else ""
+        lines.append(f"{i}. {it['title']}{src}")
+    if ai:
+        lines += ["", f"\U0001F9E0 {ai}"]
+    msg = "\n".join(lines)[:3500]
+    for chat_id in list(KNOWN_CHATS):
+        try:
+            await context.bot.send_message(chat_id, msg)
+        except Exception as e:
+            logger.error(f"Market news send error {chat_id}: {e}")
+
+
 # ------------------------------------------------------------ handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -671,6 +959,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /gmail - check mailbox & safely clean old big emails (real Gmail!)\n"
         "- /reply - read latest mails, then /reply <no> drafts your reply\n"
         "- /mailboxes - list & switch between your Gmail accounts\n"
+        "- /amazon - your Amazon seller emails as a digest (orders, payments, "
+        "inventory, FBA, alerts) + daily morning digest\n"
+        "- /search <topic> - LIVE news search: real current headlines + AI "
+        "summary (also works in plain words: 'latest news about AI')\n"
         "- /meeting start ... /meeting done - live meeting notes (voice works!)\n"
         "- 🎙️ Voice notes - hold mic & talk, I understand (room/speakerphone = everyone)\n"
         "- 🎧 Meeting recordings - send the audio file, I write minutes from ALL speakers\n"
@@ -679,7 +971,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Touch your computer files, passwords or other accounts\n"
         "- Join/recording Zoom or Meet calls (send notes/voice instead)\n"
         "- Permanent-delete anything (trash is always recoverable 30 days)\n\n"
-        "Commands: /start /clear /ppt /notes /project /gmail /reply /mailboxes /meeting\n\n"
+        "Commands: /start /clear /ppt /notes /project /gmail /reply /mailboxes /amazon /search /meeting\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
@@ -704,6 +996,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, ove
     # Natural-language Gmail cleanup request? Route to the REAL Gmail power
     if wants_gmail_cleanup(text):
         await gmail_command(update, context)
+        return
+
+    KNOWN_CHATS.add(update.effective_chat.id)
+
+    # Natural-language Amazon request? Route to the REAL Amazon digest
+    if wants_amazon(text):
+        await amazon_command(update, context, override_text=text)
+        return
+
+    # Natural-language news/search request? Route to the REAL live search
+    if wants_search(text):
+        await search_command(update, context, override_text=text)
         return
 
     status_msg = await update.message.reply_text("Thinking...")
@@ -747,11 +1051,35 @@ def main():
     app.add_handler(CommandHandler("reply", reply_command))
     app.add_handler(CommandHandler("mailboxes", mailboxes_command))
     app.add_handler(CommandHandler("meeting", meeting_command))
+    app.add_handler(CommandHandler("amazon", amazon_command))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
 
+    async def daily_digest_loop(app_ref):
+        """Send the Amazon digest every morning at 07:30 (server time)."""
+        while True:
+            try:
+                now = datetime.datetime.now()
+                target = now.replace(hour=7, minute=30, second=0, microsecond=0)
+                if now >= target:
+                    target += datetime.timedelta(days=1)
+                await asyncio.sleep((target - now).total_seconds())
+                if KNOWN_CHATS:
+                    await daily_amazon_digest(app_ref)
+                    await asyncio.sleep(120)  # small gap between pushes
+                    await daily_market_news(app_ref)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"digest loop error: {e}")
+                await asyncio.sleep(60)
+
+    app.create_task(daily_digest_loop(app))
+
     print("\nBot running! Message @LAFB_Bot\n")
+    print("Daily Amazon digest: 07:30 server time\n")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
