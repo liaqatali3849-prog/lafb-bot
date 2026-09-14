@@ -33,7 +33,7 @@ def extract_email_address(sender: str) -> str:
     m = re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", sender or "")
     return m.group(0) if m else (sender or "").strip()
 
-COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY", "")
+COMPOSIO_API_KEY = (os.getenv("COMPOSIO_API_KEY") or os.getenv("composio_api_key") or "").strip()
 COMPOSIO_BASE = "https://backend.composio.dev/api/v3"
 # These identify Liaqat's connected Gmail account (created & approved via
 # Composio's secure OAuth flow - the password never touches this bot).

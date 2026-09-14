@@ -24,8 +24,9 @@ import gmail_power
 import amazon_power
 import web_power
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+# Accept both UPPER and lowercase variable names (Railway may have either)
+BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token") or os.getenv("TOKEN") or "").strip()
+GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("gemini_api_key") or os.getenv("GEMINI_KEY") or "").strip()
 MODEL = "gemini-3.5-flash-lite"
 
 # How many past messages (user+bot) to remember per chat
@@ -33,6 +34,9 @@ MEMORY_LIMIT = 10
 
 # Per-chat selected mailbox id ("" = the original/default one)
 DEFAULT_ACCOUNT_ID = "ca_8fen8njaqNCw"
+
+# Where startup-crash reports go (Liaqat's Telegram chat). Env var overrides.
+CRASH_REPORT_CHAT_ID = ""
 
 # Honest system prompt: the bot must never fake being a doer
 SYSTEM_PROMPT = (
@@ -1087,5 +1091,31 @@ def main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+def _early_crash_report(exc_text: str):
+    """Last-resort crash reporter: if the bot dies during startup on the
+    server, send the exact traceback to Telegram (so we can see it) and
+    also print it to the deployment logs."""
+    try:
+        tok = BOT_TOKEN
+        chat = os.getenv("TELEGRAM_CHAT_ID", "") or CRASH_REPORT_CHAT_ID
+        if tok and chat:
+            requests.post(
+                f"https://api.telegram.org/bot{tok}/sendMessage",
+                json={"chat_id": chat,
+                      "text": "🚨 Bot crashed at startup. Error:\n\n" + exc_text[:3500]},
+                timeout=10,
+            )
+    except Exception:
+        pass
+    print(exc_text, flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        _early_crash_report(traceback.format_exc())
+        raise
