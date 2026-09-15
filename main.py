@@ -15,6 +15,7 @@ import sys
 import asyncio
 import datetime
 import logging
+import threading
 from google import genai
 from google.genai import types as genai_types
 from telegram import Update
@@ -30,7 +31,9 @@ GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("gemini_api_key") or os.g
 MODEL = "gemini-3.5-flash-lite"
 
 # How many past messages (user+bot) to remember per chat
-MEMORY_LIMIT = 10
+MEMORY_LIMIT = 30
+# When memory overflows, fold this many OLDEST messages into the summary note
+SUMMARY_EVERY = 12
 
 # Per-chat selected mailbox id ("" = the original/default one)
 DEFAULT_ACCOUNT_ID = "ca_8fen8njaqNCw"
@@ -92,6 +95,9 @@ logger = logging.getLogger(__name__)
 
 # chat_id -> list of {"role": "user"|"model", "text": str}
 MEMORY_STORE = {}
+# Long-term "memory note" per chat: a compact Gemini-written summary of
+# older conversation that no longer fits in the verbatim history.
+CHAT_SUMMARIES = {}
 
 # Chats that ever talked to us (for the daily Amazon digest)
 KNOWN_CHATS = set()
@@ -115,14 +121,57 @@ def build_prompt(chat_id: int, user_text: str) -> str:
     for msg in history:
         who = "User" if msg["role"] == "user" else "You"
         lines.append(f"{who}: {msg['text']}")
+    note = CHAT_SUMMARIES.get(chat_id, "")
     if lines:
-        return (
-            "Conversation so far (most recent last):\n"
-            + "\n".join(lines)
-            + "\n\nUser's new message: "
-            + user_text
+        parts = []
+        if note:
+            parts.append(
+                "Earlier memory (summary of older conversation):\n" + note
+            )
+        parts.append(
+            "Conversation so far (most recent last):\n" + "\n".join(lines)
         )
+        parts.append("User's new message: " + user_text)
+        return "\n\n".join(parts)
     return user_text
+
+
+_SUMMARY_LOCK = threading.Lock()
+
+
+def summarize_overflow(chat_id: int) -> None:
+    """Fold the oldest SUMMARY_EVERY messages into the chat's memory note
+    using Gemini, so nothing important is ever just thrown away.
+    The trim happens synchronously here (memory never grows unbounded);
+    only the Gemini call could be slow, and it never blocks the reply."""
+    with _SUMMARY_LOCK:
+        key = f"chat_{chat_id}"
+        history = context_history(key)
+        if len(history) < SUMMARY_EVERY + 4:
+            return
+        old, history[:] = history[:SUMMARY_EVERY], history[SUMMARY_EVERY:]
+        set_context_history(key, history)
+    try:
+        convo = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Bot'}: {m['text']}"
+            for m in old
+        )
+        prev = CHAT_SUMMARIES.get(chat_id, "")
+        prompt = (
+            "Merge these older chat messages into a running memory note.\n"
+            "Keep: names, dates, numbers, decisions, promises, preferences,\n"
+            "open tasks. Drop small talk. Max 150 words.\n\n"
+        )
+        if prev:
+            prompt += f"Existing note:\n{prev}\n\nNew older messages:\n{convo}"
+        else:
+            prompt += f"Older messages:\n{convo}"
+        r = gemini_client.models.generate_content(model=MODEL, contents=prompt)
+        if r and getattr(r, "text", "").strip():
+            CHAT_SUMMARIES[chat_id] = r.text.strip()
+            logger.info(f"memory note updated for chat {chat_id}")
+    except Exception as e:
+        logger.error(f"memory summarize failed (non-fatal): {e}")
 
 
 def save_exchange(chat_id: int, user_text: str, bot_text: str):
@@ -130,9 +179,14 @@ def save_exchange(chat_id: int, user_text: str, bot_text: str):
     history = context_history(key)
     history.append({"role": "user", "text": user_text})
     history.append({"role": "model", "text": bot_text})
-    if len(history) > MEMORY_LIMIT:
-        del history[:-MEMORY_LIMIT]
     set_context_history(key, history)
+    # Overflow: once history passes 30+12, fold the 12 oldest messages into
+    # the memory note (in background — the reply already went out). The
+    # trim itself happens synchronously inside summarize_overflow.
+    if len(history) > MEMORY_LIMIT + SUMMARY_EVERY:
+        threading.Thread(
+            target=summarize_overflow, args=(chat_id,), daemon=True
+        ).start()
 
 
 def current_account_id(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -956,7 +1010,9 @@ async def daily_market_news(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Welcome to LAFB_Bot!\n\n"
-        "I am your AI assistant. I remember our conversation while we talk.\n\n"
+        "I am your AI assistant. I remember our conversation - the recent "
+        "messages word-for-word, and older ones as a summary note (/memory "
+        "shows exactly what I remember).\n\n"
         "What I CAN do:\n"
         "- Answer questions & chat (with memory)\n"
         "- /ppt <topic> - PowerPoint sent right here (also works in plain words!)\n"
@@ -977,14 +1033,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Touch your computer files, passwords or other accounts\n"
         "- Join/recording Zoom or Meet calls (send notes/voice instead)\n"
         "- Permanent-delete anything (trash is always recoverable 30 days)\n\n"
-        "Commands: /start /clear /ppt /notes /project /gmail /reply /mailboxes /amazon /search /meeting\n\n"
+        "Commands: /start /clear /memory /ppt /notes /project /gmail /reply /mailboxes /amazon /search /meeting\n\n"
         f"AI: {'Active' if gemini_client else 'Inactive'}"
     )
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     MEMORY_STORE.pop(f"chat_{update.effective_chat.id}", None)
+    CHAT_SUMMARIES.pop(update.effective_chat.id, None)
     await update.message.reply_text("Memory cleared. Fresh start! 🧹")
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the bot exactly what it remembers about this chat."""
+    chat_id = update.effective_chat.id
+    history = context_history(f"chat_{chat_id}")
+    note = CHAT_SUMMARIES.get(chat_id, "")
+    lines = ["🧠 What I remember right now:"]
+    if note:
+        lines.append("\n📖 Older-conversation note:\n" + note)
+    else:
+        lines.append("\n📖 Older-conversation note: (none yet)")
+    lines.append(f"\n💬 Recent messages kept word-for-word: {len(history)}")
+    if history:
+        for m in history[-4:]:
+            who = "You" if m["role"] == "user" else "Me"
+            lines.append(f"- {who}: {m['text'][:60]}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, override_text: str = ""):
@@ -1057,6 +1132,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("ppt", ppt_command))
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("project", project_command))
@@ -1067,6 +1143,9 @@ def main():
     app.add_handler(CommandHandler("amazon", amazon_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Safety net: unknown /commands become normal chat instead of dying silently.
+    # (Telegram bots IGNORE unknown commands with no reply - this catches them.)
+    app.add_handler(MessageHandler(filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
 
