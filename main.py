@@ -36,7 +36,7 @@ MEMORY_LIMIT = 10
 DEFAULT_ACCOUNT_ID = "ca_8fen8njaqNCw"
 
 # Where startup-crash reports go (Liaqat's Telegram chat). Env var overrides.
-CRASH_REPORT_CHAT_ID = ""
+CRASH_REPORT_CHAT_ID = "8381161973"
 
 # Honest system prompt: the bot must never fake being a doer
 SYSTEM_PROMPT = (
@@ -95,6 +95,8 @@ MEMORY_STORE = {}
 
 # Chats that ever talked to us (for the daily Amazon digest)
 KNOWN_CHATS = set()
+# Strong reference to the daily-digest background task (keeps it alive).
+DIGEST_TASK = None
 
 
 def context_history(key: str):
@@ -1049,7 +1051,8 @@ def main():
         """run_polling calls this INSIDE the live event loop — the only safe
         place to launch background tasks (calling create_task earlier crashes)."""
         # plain asyncio task (loop is live here); keep a reference so it's never GC'd
-        application.digest_task = asyncio.create_task(daily_digest_loop(application))
+        global DIGEST_TASK
+        DIGEST_TASK = asyncio.create_task(daily_digest_loop(application))
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
